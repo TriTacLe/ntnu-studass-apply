@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+out/
+storage_state.json
+profile/
+CLAUDE.md
+DESIGN.md
+.claude/
+.mcp.json
+.playwright-mcp/
