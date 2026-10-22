@@ -33,6 +33,10 @@ ELEVEN_DIGITS = re.compile(r"\b\d{11}\b")
 DEADLINE = re.compile(r"frist[^0-9]{0,40}(\d{1,2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{2,4})", re.I)
 STATUS_WORDS = re.compile(r"Registrert|Under behandling|Tilbud", re.I)
 SUBMIT_TEXT = re.compile(r"legg inn|søk|send|lagre", re.I)
+JUNK_LABEL = re.compile(r"^\s*test", re.I)
+GJOVIK = re.compile(r"gj.vik", re.I)
+GJOVIK_CODE = re.compile(r"^(IDATG|IELEG|ELEG|IDG|PROG|G1001)", re.I)
+TIERS = ("TDT IT DCST DIFT ITO IDI IDATT", "TTM IIK IIKT", "TTK", "MA TMA IMAT IMAG TFOR")
 
 
 def die(code, message):
@@ -131,9 +135,10 @@ def discover_form(page):
         for option in handle.query_selector_all("option"):
             value = option.get_attribute("value") or ""
             label = (option.inner_text() or "").strip()
+            if not value or value == "0":
+                continue
             code = COURSE_CODE.search(label)
-            if value and code:
-                options.append({"value": value, "label": label, "code": code.group(1)})
+            options.append({"value": value, "label": label, "code": code.group(1) if code else ""})
         if options and (best is None or len(options) > len(best["options"])):
             name = handle.get_attribute("name") or handle.get_attribute("id") or ""
             best = {"handle": handle, "name": name, "options": options}
@@ -148,16 +153,32 @@ def discover_form(page):
 
 
 def active_applications(page):
+    """Rows of Mine søknader. One row per listing, so variants of a course both count."""
     body = page.inner_text("body")
     if re.search(r"Ingen søknader registrert", body, re.I):
-        return {}
-    found = {}
+        return []
+    rows = []
     for row in page.query_selector_all("table tr"):
         text = " ".join((row.inner_text() or "").split())
-        code = COURSE_CODE.search(text)
-        if code and STATUS_WORDS.search(text):
-            found[code.group(1)] = text
-    return found
+        if COURSE_CODE.search(text) and STATUS_WORDS.search(text):
+            rows.append(text)
+    return rows
+
+
+def applied(rows, code):
+    return bool(code) and any(code in row for row in rows)
+
+
+def offered(page):
+    select, _, _ = discover_form(page)
+    return {o["value"] for o in select["options"]} if select else set()
+
+
+def tier(code):
+    for n, group in enumerate(TIERS):
+        if any(code.startswith(prefix) for prefix in group.split()):
+            return n
+    return len(TIERS)
 
 
 def priority_order():
@@ -177,14 +198,27 @@ def comment_text():
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def ordered(options, only=None, exclude=None):
-    wanted = [o for o in options if (not only or o["code"] in only) and o["code"] not in (exclude or [])]
+def keep(option, only, exclude, campus):
+    if JUNK_LABEL.match(option["label"]):
+        return False
+    if only and option["code"] not in only:
+        return False
+    if option["code"] and option["code"] in (exclude or []):
+        return False
+    if campus == "trondheim":
+        if GJOVIK.search(option["label"]) or GJOVIK_CODE.match(option["label"]):
+            return False
+    return True
+
+
+def ordered(options, only=None, exclude=None, campus=None):
+    wanted = [o for o in options if keep(o, only, exclude, campus)]
     ranking = priority_order()
     def key(option):
         try:
-            return (0, ranking.index(option["code"]))
+            return (0, ranking.index(option["code"]), "")
         except ValueError:
-            return (1, 0)
+            return (1, tier(option["code"]), option["label"])
     return sorted(wanted, key=key)
 
 
@@ -253,8 +287,8 @@ def cmd_list(args):
         if not select:
             die(EXIT_ROUND_CLOSED, "no course select on the application page, so nothing is on offer")
         active = active_applications(page)
-        for option in ordered(select["options"]):
-            mark = "already applied" if option["code"] in active else ""
+        for option in ordered(select["options"], campus=args.campus):
+            mark = "already applied" if applied(active, option["code"]) else ""
             print(f"  {option['code']:<10} {option['label'][:70]:<70} {mark}")
         OUT.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -276,7 +310,7 @@ def cmd_status(args):
             print("Aktive søknader: none registered")
             return
         print(f"Aktive søknader: {len(active)}")
-        for code, row in active.items():
+        for row in active:
             print(" ", row)
 
 
@@ -293,45 +327,53 @@ def cmd_apply(args):
         select, comment_field, submit = discover_form(page)
         if not select:
             die(EXIT_ROUND_CLOSED, "no course select on the application page")
-        plan = ordered(select["options"], only, exclude)
+        plan = ordered(select["options"], only, exclude, args.campus)
         active = active_applications(page)
         print(f"Round: {title}")
-        print(f"{len(plan)} course(s) in priority order, {len(active)} already registered")
+        print(f"{len(plan)} listing(s) in priority order, {len(active)} already registered")
         if not args.submit:
             for n, option in enumerate(plan, 1):
-                state = "skip, already registered" if option["code"] in active else "would submit"
-                print(f"  {n:>2}. {option['code']:<10} {state}")
+                print(f"  {n:>3}. {option['label'][:72]:<72} would submit")
             print("\nComment that would be sent:\n" + (comment or "(comment.txt is empty)"))
             print("\nDry run. Add --submit to register these.")
             return
         shots.mkdir(parents=True, exist_ok=True)
         failed = []
         for n, option in enumerate(plan, 1):
-            if option["code"] in active:
-                print(f"{n:>2}. {option['code']} already registered, skipping")
-                continue
+            name = option["label"][:50]
             goto(page, APPLY_PAGE)
             select, comment_field, submit = discover_form(page)
             if not (select and submit):
-                failed.append((option["code"], "form controls not found"))
+                failed.append((name, "form controls not found"))
                 continue
+            if option["value"] not in {o["value"] for o in select["options"]}:
+                print(f"{n:>3}. {name} no longer on offer, skipping")
+                continue
+            before = len(active_applications(page))
             page.select_option(f"select[name='{select['name']}']" if select["name"] else "select", option["value"])
             if comment_field and comment:
                 comment_field.fill(comment)
+            for box in page.query_selector_all("input[type=checkbox]"):
+                if not box.is_checked():
+                    box.check()
             submit.click()
             page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(1500)
-            active = active_applications(page)
-            if option["code"] in active:
-                print(f"{n:>2}. {option['code']} registered")
+            page.wait_for_timeout(1200)
+            gone = option["value"] not in offered(page)
+            grew = len(active_applications(page)) > before
+            if gone and grew:
+                print(f"{n:>3}. {name} registered")
             else:
-                failed.append((option["code"], "not in Aktive søknader after submit"))
-                print(f"{n:>2}. {option['code']} submit not confirmed")
-            page.screenshot(path=str(shots / f"{option['code']}-{date.today().isoformat()}.png"), full_page=True)
+                failed.append((name, f"gone={gone} grew={grew}"))
+                print(f"{n:>3}. {name} submit not confirmed")
+                page.screenshot(
+                    path=str(shots / f"failed-{option['value']}-{date.today().isoformat()}.png"),
+                    full_page=True,
+                )
         cmd_status_inline(page)
         if failed:
-            for code, why in failed:
-                print(f"unconfirmed: {code}: {why}", file=sys.stderr)
+            for name, why in failed:
+                print(f"unconfirmed: {name}: {why}", file=sys.stderr)
             sys.exit(EXIT_UNVERIFIED)
 
 
@@ -339,7 +381,7 @@ def cmd_status_inline(page):
     goto(page, APPLY_PAGE)
     active = active_applications(page)
     print(f"\nAktive søknader: {len(active)}")
-    for row in active.values():
+    for row in active:
         print(" ", row)
 
 
@@ -380,12 +422,15 @@ def main():
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
     sub.add_parser("login").set_defaults(func=cmd_login)
     sub.add_parser("dump").set_defaults(func=cmd_dump)
-    sub.add_parser("list").set_defaults(func=cmd_list)
+    list_cmd = sub.add_parser("list")
+    list_cmd.add_argument("--campus", choices=("trondheim",))
+    list_cmd.set_defaults(func=cmd_list)
     sub.add_parser("status").set_defaults(func=cmd_status)
     apply_cmd = sub.add_parser("apply")
     apply_cmd.add_argument("--all", action="store_true")
     apply_cmd.add_argument("--only")
     apply_cmd.add_argument("--exclude")
+    apply_cmd.add_argument("--campus", choices=("trondheim",))
     apply_cmd.add_argument("--submit", action="store_true", help="actually register the applications")
     apply_cmd.set_defaults(func=cmd_apply)
     profile_cmd = sub.add_parser("profile")
