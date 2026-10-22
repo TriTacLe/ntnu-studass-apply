@@ -91,8 +91,8 @@ def goto(page, url, attempts=3):
 
 
 def logged_in(page):
-    html = page.content()
-    return "soknad_opprett" in html or "student_endre_data" in html
+    body = page.inner_text("body")
+    return bool(re.search(r"Logget inn som|Logg ut", body))
 
 
 def require_session(page, url=APPLY_PAGE):
@@ -350,10 +350,11 @@ def cmd_apply(args):
                 print(f"{n:>3}. {name} no longer on offer, skipping")
                 continue
             before = len(active_applications(page))
-            page.select_option(f"select[name='{select['name']}']" if select["name"] else "select", option["value"])
+            field = select["name"] if re.fullmatch(r"[A-Za-z_][\w-]*", select["name"] or "") else ""
+            page.select_option(f"select[name='{field}']" if field else "select", option["value"])
             if comment_field and comment:
                 comment_field.fill(comment)
-            for box in page.query_selector_all("input[type=checkbox]"):
+            for box in page.query_selector_all("form input[type=checkbox][name*=eula i]"):
                 if not box.is_checked():
                     box.check()
             submit.click()
