@@ -38,7 +38,6 @@ IDP_HOSTS = ("idp.feide.no", "auth.dataporten.no", "login.microsoftonline.com", 
 COURSE_CODE = re.compile(r"\b([A-ZÆØÅ]{2,6}\d{4})\b")
 ELEVEN_DIGITS = re.compile(r"\b\d{11}\b")
 DEADLINE = re.compile(r"frist[^0-9]{0,40}(\d{1,2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{2,4})", re.I)
-STATUS_WORDS = re.compile(r"Registrert|Under behandling|Tilbud", re.I)
 SUBMIT_TEXT = re.compile(r"legg inn|søk|send|lagre", re.I)
 JUNK_LABEL = re.compile(r"^\s*test", re.I)
 GJOVIK = re.compile(r"gj.vik", re.I)
@@ -165,15 +164,12 @@ def discover_form(page):
 
 
 def active_applications(page):
-    """Rows of Mine søknader. One row per listing, so variants of a course both count."""
-    body = page.inner_text("body")
-    if re.search(r"Ingen søknader registrert", body, re.I):
-        return []
+    """Rows of Mine søknader. Every row carries withdraw and reorder links, codeless
+    listings like TFE4120lab included, so counting them is safe to compare."""
     rows = []
     for row in page.query_selector_all("table tr"):
-        text = " ".join((row.inner_text() or "").split())
-        if COURSE_CODE.search(text) and STATUS_WORDS.search(text):
-            rows.append(text)
+        if row.query_selector("a[href*='soknad=']"):
+            rows.append(" ".join((row.inner_text() or "").split()))
     return rows
 
 
