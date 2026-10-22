@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import socket
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
@@ -28,11 +31,18 @@ EXIT_ROUND_CLOSED = 3
 EXIT_UNVERIFIED = 4
 EXIT_UNREACHABLE = 5
 
+NTNU_USER = os.environ.get("NTNU_USER", "trile@stud.ntnu.no")
+LOGIN_TIMEOUT_MS = 600_000
+IDP_HOSTS = ("idp.feide.no", "auth.dataporten.no", "login.microsoftonline.com", "login.microsoft.com")
+
 COURSE_CODE = re.compile(r"\b([A-ZÆØÅ]{2,6}\d{4})\b")
 ELEVEN_DIGITS = re.compile(r"\b\d{11}\b")
 DEADLINE = re.compile(r"frist[^0-9]{0,40}(\d{1,2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{2,4})", re.I)
-STATUS_WORDS = re.compile(r"Registrert|Under behandling|Tilbud", re.I)
 SUBMIT_TEXT = re.compile(r"legg inn|søk|send|lagre", re.I)
+JUNK_LABEL = re.compile(r"^\s*test", re.I)
+GJOVIK = re.compile(r"gj.vik", re.I)
+GJOVIK_CODE = re.compile(r"^(IDATG|IELEG|ELEG|IDG|PROG|G1001)", re.I)
+TIERS = ("TDT IT DCST DIFT ITO IDI IDATT", "TTM IIK IIKT", "TTK", "MA TMA IMAT IMAG TFOR")
 
 
 def die(code, message):
@@ -66,6 +76,11 @@ def portal(headless=True):
             headless=headless,
             viewport={"width": 1400, "height": 1000},
         )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'credentials', {get: () => ({"
+            "get: () => Promise.reject(new DOMException('NotAllowedError')),"
+            "create: () => Promise.reject(new DOMException('NotAllowedError'))}), configurable: true});"
+        )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(30000)
         try:
@@ -87,8 +102,8 @@ def goto(page, url, attempts=3):
 
 
 def logged_in(page):
-    html = page.content()
-    return "soknad_opprett" in html or "student_endre_data" in html
+    body = page.inner_text("body")
+    return bool(re.search(r"Logget inn som|Logg ut", body))
 
 
 def require_session(page, url=APPLY_PAGE):
@@ -131,9 +146,10 @@ def discover_form(page):
         for option in handle.query_selector_all("option"):
             value = option.get_attribute("value") or ""
             label = (option.inner_text() or "").strip()
+            if not value or value == "0":
+                continue
             code = COURSE_CODE.search(label)
-            if value and code:
-                options.append({"value": value, "label": label, "code": code.group(1)})
+            options.append({"value": value, "label": label, "code": code.group(1) if code else ""})
         if options and (best is None or len(options) > len(best["options"])):
             name = handle.get_attribute("name") or handle.get_attribute("id") or ""
             best = {"handle": handle, "name": name, "options": options}
@@ -148,16 +164,29 @@ def discover_form(page):
 
 
 def active_applications(page):
-    body = page.inner_text("body")
-    if re.search(r"Ingen søknader registrert", body, re.I):
-        return {}
-    found = {}
+    """Rows of Mine søknader. Every row carries withdraw and reorder links, codeless
+    listings like TFE4120lab included, so counting them is safe to compare."""
+    rows = []
     for row in page.query_selector_all("table tr"):
-        text = " ".join((row.inner_text() or "").split())
-        code = COURSE_CODE.search(text)
-        if code and STATUS_WORDS.search(text):
-            found[code.group(1)] = text
-    return found
+        if row.query_selector("a[href*='soknad=']"):
+            rows.append(" ".join((row.inner_text() or "").split()))
+    return rows
+
+
+def applied(rows, code):
+    return bool(code) and any(code in row for row in rows)
+
+
+def offered(page):
+    select, _, _ = discover_form(page)
+    return {o["value"] for o in select["options"]} if select else set()
+
+
+def tier(code):
+    for n, group in enumerate(TIERS):
+        if any(code.startswith(prefix) for prefix in group.split()):
+            return n
+    return len(TIERS)
 
 
 def priority_order():
@@ -177,14 +206,27 @@ def comment_text():
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def ordered(options, only=None, exclude=None):
-    wanted = [o for o in options if (not only or o["code"] in only) and o["code"] not in (exclude or [])]
+def keep(option, only, exclude, campus):
+    if JUNK_LABEL.match(option["label"]):
+        return False
+    if only and option["code"] not in only:
+        return False
+    if option["code"] and option["code"] in (exclude or []):
+        return False
+    if campus == "trondheim":
+        if GJOVIK.search(option["label"]) or GJOVIK_CODE.match(option["label"]):
+            return False
+    return True
+
+
+def ordered(options, only=None, exclude=None, campus=None):
+    wanted = [o for o in options if keep(o, only, exclude, campus)]
     ranking = priority_order()
     def key(option):
         try:
-            return (0, ranking.index(option["code"]))
+            return (0, ranking.index(option["code"]), "")
         except ValueError:
-            return (1, 0)
+            return (1, tier(option["code"]), option["label"])
     return sorted(wanted, key=key)
 
 
@@ -202,6 +244,138 @@ def codes_arg(value):
     return [c.strip().upper() for c in value.split(",") if c.strip()] if value else []
 
 
+def host(url):
+    return urlparse(url).hostname or ""
+
+
+def password(user):
+    """Password from a file, the keyring, or the environment. Empty means type it yourself."""
+    path = os.environ.get("NTNU_PASSWORD_FILE", "")
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    try:
+        found = subprocess.run(
+            ["secret-tool", "lookup", "service", "studass", "username", user],
+            capture_output=True, text=True, timeout=5,
+        )
+        if found.returncode == 0 and found.stdout.strip():
+            return found.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("NTNU_PASSWORD", "")
+
+
+def pick_ntnu(page):
+    """Feide org selector: choose NTNU and submit."""
+    page.evaluate("""() => {
+        const field = document.getElementById('org_selector');
+        if (field) field.value = 'feide|realm|ntnu.no';
+        const form = document.getElementById('discoform_feide');
+        if (form) form.submit();
+    }""")
+
+
+def pick_microsoft(page):
+    for selector in ("#microsoft-signin-button", "form[action*='login-azuread'] input[type=submit]"):
+        box = page.locator(selector)
+        if box.count():
+            box.first.click(force=True, timeout=2000)
+            return True
+    for label in ("Bruk arbeids- eller skolekonto", "Logg inn med Microsoft", "Use work or school account"):
+        box = page.locator(f"button:has-text('{label}'), a:has-text('{label}')")
+        if box.count():
+            box.first.click(force=True, timeout=2000)
+            return True
+    return False
+
+
+def fill_credentials(page, user, secret):
+    for selector in ("input[type=email]", "input[name=loginfmt]", "input[name=username]"):
+        field = page.locator(selector)
+        if field.count() and field.first.is_visible() and not field.first.input_value():
+            field.first.fill(user)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(1500)
+            return
+    if secret:
+        field = page.locator("input[type=password]")
+        if field.count() and field.first.is_visible() and not field.first.input_value():
+            field.first.fill(secret)
+            page.keyboard.press("Enter")
+
+
+def click_text(page, *labels):
+    for label in labels:
+        box = page.locator(f"button:has-text('{label}'), a:has-text('{label}'), input[value='{label}']")
+        if box.count():
+            try:
+                box.first.click(force=True, timeout=2000)
+                return True
+            except PlaywrightTimeout:
+                pass
+    return False
+
+
+def mfa_number(page):
+    box = page.locator("#idRichContext_DisplaySign")
+    if box.count():
+        text = (box.first.text_content(timeout=1000) or "").strip()
+        if text.isdigit():
+            return text
+    return ""
+
+
+def drive_login(page, user, timeout_ms=LOGIN_TIMEOUT_MS):
+    """Walk Feide and Entra as far as it goes. Returns once the portal is reachable."""
+    secret = password(user)
+    if not secret:
+        print("No stored password, type it in the window when Microsoft asks.")
+    shown = ""
+    waited = 0
+    while waited < timeout_ms:
+        page.wait_for_timeout(2000)
+        waited += 2000
+        where = host(page.url)
+        if where == "ie.ntnu.no":
+            if logged_in(page):
+                return True
+            goto(page, APPLY_PAGE)
+            continue
+        if where not in IDP_HOSTS:
+            continue
+        if where == "auth.dataporten.no":
+            tile = page.locator("#accounts a.section-list")
+            if tile.count():
+                tile.first.click(timeout=2000)
+                continue
+            pick_ntnu(page)
+            pick_microsoft(page)
+            continue
+        if where == "idp.feide.no":
+            if not pick_microsoft(page):
+                fill_credentials(page, user, secret)
+            continue
+        if "fido" in page.url:
+            click_text(page, "Sign in another way", "Logg på på en annen måte")
+            page.keyboard.press("Escape")
+            continue
+        number = mfa_number(page)
+        if number:
+            if number != shown:
+                print(f"MFA number: {number}  (type it in Authenticator)")
+                shown = number
+            continue
+        if click_text(page, "Ja", "Yes"):          # stay signed in, keeps the session alive
+            continue
+        if click_text(page, "Approve a request on my Microsoft Authenticator app", "Approve a request"):
+            continue
+        fill_credentials(page, user, secret)
+    return False
+
+
 def cmd_preflight(args):
     ok, message = reachable()
     print(message)
@@ -214,13 +388,9 @@ def cmd_login(args):
         die(EXIT_UNREACHABLE, message)
     with portal(headless=False) as (ctx, page):
         goto(page, SSO)
-        print("Log in with Feide in the window that opened.")
-        while True:
-            input("Press Enter when the studass portal is on screen: ")
-            goto(page, APPLY_PAGE)
-            if logged_in(page):
-                break
-            print("The portal still does not look logged in. Finish the login and try again.")
+        print(f"Logging in as {args.user}. NTNU is picked for you, MFA is yours.")
+        if not drive_login(page, args.user):
+            die(EXIT_NO_SESSION, "login did not finish in time, run it again")
         who = username(page)
         print("Brukernavn:", who or "could not read it from the profile page")
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -253,8 +423,8 @@ def cmd_list(args):
         if not select:
             die(EXIT_ROUND_CLOSED, "no course select on the application page, so nothing is on offer")
         active = active_applications(page)
-        for option in ordered(select["options"]):
-            mark = "already applied" if option["code"] in active else ""
+        for option in ordered(select["options"], campus=args.campus):
+            mark = "already applied" if applied(active, option["code"]) else ""
             print(f"  {option['code']:<10} {option['label'][:70]:<70} {mark}")
         OUT.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -276,7 +446,7 @@ def cmd_status(args):
             print("Aktive søknader: none registered")
             return
         print(f"Aktive søknader: {len(active)}")
-        for code, row in active.items():
+        for row in active:
             print(" ", row)
 
 
@@ -293,45 +463,54 @@ def cmd_apply(args):
         select, comment_field, submit = discover_form(page)
         if not select:
             die(EXIT_ROUND_CLOSED, "no course select on the application page")
-        plan = ordered(select["options"], only, exclude)
+        plan = ordered(select["options"], only, exclude, args.campus)
         active = active_applications(page)
         print(f"Round: {title}")
-        print(f"{len(plan)} course(s) in priority order, {len(active)} already registered")
+        print(f"{len(plan)} listing(s) in priority order, {len(active)} already registered")
         if not args.submit:
             for n, option in enumerate(plan, 1):
-                state = "skip, already registered" if option["code"] in active else "would submit"
-                print(f"  {n:>2}. {option['code']:<10} {state}")
+                print(f"  {n:>3}. {option['label'][:72]:<72} would submit")
             print("\nComment that would be sent:\n" + (comment or "(comment.txt is empty)"))
             print("\nDry run. Add --submit to register these.")
             return
         shots.mkdir(parents=True, exist_ok=True)
         failed = []
         for n, option in enumerate(plan, 1):
-            if option["code"] in active:
-                print(f"{n:>2}. {option['code']} already registered, skipping")
-                continue
+            name = option["label"][:50]
             goto(page, APPLY_PAGE)
             select, comment_field, submit = discover_form(page)
             if not (select and submit):
-                failed.append((option["code"], "form controls not found"))
+                failed.append((name, "form controls not found"))
                 continue
-            page.select_option(f"select[name='{select['name']}']" if select["name"] else "select", option["value"])
+            if option["value"] not in {o["value"] for o in select["options"]}:
+                print(f"{n:>3}. {name} no longer on offer, skipping")
+                continue
+            before = len(active_applications(page))
+            field = select["name"] if re.fullmatch(r"[A-Za-z_][\w-]*", select["name"] or "") else ""
+            page.select_option(f"select[name='{field}']" if field else "select", option["value"])
             if comment_field and comment:
                 comment_field.fill(comment)
+            for box in page.query_selector_all("form input[type=checkbox][name*=eula i]"):
+                if not box.is_checked():
+                    box.check()
             submit.click()
             page.wait_for_load_state("domcontentloaded")
-            page.wait_for_timeout(1500)
-            active = active_applications(page)
-            if option["code"] in active:
-                print(f"{n:>2}. {option['code']} registered")
+            page.wait_for_timeout(1200)
+            gone = option["value"] not in offered(page)
+            grew = len(active_applications(page)) > before
+            if gone and grew:
+                print(f"{n:>3}. {name} registered")
             else:
-                failed.append((option["code"], "not in Aktive søknader after submit"))
-                print(f"{n:>2}. {option['code']} submit not confirmed")
-            page.screenshot(path=str(shots / f"{option['code']}-{date.today().isoformat()}.png"), full_page=True)
+                failed.append((name, f"gone={gone} grew={grew}"))
+                print(f"{n:>3}. {name} submit not confirmed")
+                page.screenshot(
+                    path=str(shots / f"failed-{option['value']}-{date.today().isoformat()}.png"),
+                    full_page=True,
+                )
         cmd_status_inline(page)
         if failed:
-            for code, why in failed:
-                print(f"unconfirmed: {code}: {why}", file=sys.stderr)
+            for name, why in failed:
+                print(f"unconfirmed: {name}: {why}", file=sys.stderr)
             sys.exit(EXIT_UNVERIFIED)
 
 
@@ -339,7 +518,7 @@ def cmd_status_inline(page):
     goto(page, APPLY_PAGE)
     active = active_applications(page)
     print(f"\nAktive søknader: {len(active)}")
-    for row in active.values():
+    for row in active:
         print(" ", row)
 
 
@@ -378,14 +557,19 @@ def main():
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
-    sub.add_parser("login").set_defaults(func=cmd_login)
+    login_cmd = sub.add_parser("login")
+    login_cmd.add_argument("--user", default=NTNU_USER)
+    login_cmd.set_defaults(func=cmd_login)
     sub.add_parser("dump").set_defaults(func=cmd_dump)
-    sub.add_parser("list").set_defaults(func=cmd_list)
+    list_cmd = sub.add_parser("list")
+    list_cmd.add_argument("--campus", choices=("trondheim",))
+    list_cmd.set_defaults(func=cmd_list)
     sub.add_parser("status").set_defaults(func=cmd_status)
     apply_cmd = sub.add_parser("apply")
     apply_cmd.add_argument("--all", action="store_true")
     apply_cmd.add_argument("--only")
     apply_cmd.add_argument("--exclude")
+    apply_cmd.add_argument("--campus", choices=("trondheim",))
     apply_cmd.add_argument("--submit", action="store_true", help="actually register the applications")
     apply_cmd.set_defaults(func=cmd_apply)
     profile_cmd = sub.add_parser("profile")

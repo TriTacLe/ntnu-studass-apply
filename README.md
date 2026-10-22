@@ -26,17 +26,28 @@ NTNU VPN before anything else:
     ./studass.py preflight                      # VPN and host reachability
     ./studass.py login                          # headed, you do Feide once
     ./studass.py dump                           # raw HTML of the three pages into out/raw/
-    ./studass.py list                           # round, deadline, every course on offer
-    ./studass.py apply --all                    # dry run, prints what it would submit
-    ./studass.py apply --all --submit           # registers one application per course
+    ./studass.py list --campus trondheim        # round, deadline, every listing on offer
+    ./studass.py apply --all --campus trondheim           # dry run, prints what it would submit
+    ./studass.py apply --all --campus trondheim --submit   # one application per listing
     ./studass.py apply --all --exclude IDATT2105 --submit
     ./studass.py apply --only IDATT2106,TDT4114 --submit
     ./studass.py status                         # Aktive søknader
     ./studass.py profile --laos ~/laos.pdf      # uploads the LAOS kursbevis
 
-`login` opens a real window, you finish Feide yourself, and the Chromium profile under
-`~/.local/share/studass/profile` keeps the session for later runs. The script never reads,
-types or stores a password.
+`login` opens a real window and walks the chain itself: NTNU in the Feide org selector, the
+Microsoft method button, your mail address, the password if one is stored, "stay signed in" so
+the session survives, and it prints the number-matching code while you approve on the phone. The
+Chromium profile under `~/.local/share/studass/profile` keeps that session, so later rounds
+usually need the MFA tap alone, often nothing.
+
+The address defaults to `trile@stud.ntnu.no`, override with `--user` or `NTNU_USER`. The password
+is looked for in `NTNU_PASSWORD_FILE`, then the keyring, then `NTNU_PASSWORD`, and if none of
+them has it you simply type it in the window. To stop typing it:
+
+    secret-tool store --label="NTNU Feide" service studass username trile@stud.ntnu.no
+
+`--campus trondheim` drops the Gjøvik positions, and the portal's three TEST listings are never
+submitted to.
 
 `apply` is a dry run unless `--submit` is given. Submission order carries the priority, and
 the portal lets you reprioritise until the deadline. Courses already in Aktive søknader are
@@ -46,6 +57,7 @@ skipped, so a rerun is safe.
 
 - It never types a personnummer. `profile --laos` only uploads the certificate; if the
   portal refuses to save because the personnummer field is empty, it stops and tells you.
+- It never stores a password of its own. It reads one you put in the keyring, nothing else.
 - `dump` strips eleven-digit numbers and the personnummer input value before writing the
   profile page to disk.
 
