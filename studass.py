@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
 import socket
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
@@ -27,6 +30,10 @@ EXIT_NO_SESSION = 2
 EXIT_ROUND_CLOSED = 3
 EXIT_UNVERIFIED = 4
 EXIT_UNREACHABLE = 5
+
+NTNU_USER = os.environ.get("NTNU_USER", "trile@stud.ntnu.no")
+LOGIN_TIMEOUT_MS = 600_000
+IDP_HOSTS = ("idp.feide.no", "auth.dataporten.no", "login.microsoftonline.com", "login.microsoft.com")
 
 COURSE_CODE = re.compile(r"\b([A-ZÆØÅ]{2,6}\d{4})\b")
 ELEVEN_DIGITS = re.compile(r"\b\d{11}\b")
@@ -69,6 +76,11 @@ def portal(headless=True):
             user_data_dir=str(PROFILE_DIR),
             headless=headless,
             viewport={"width": 1400, "height": 1000},
+        )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'credentials', {get: () => ({"
+            "get: () => Promise.reject(new DOMException('NotAllowedError')),"
+            "create: () => Promise.reject(new DOMException('NotAllowedError'))}), configurable: true});"
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(30000)
@@ -236,6 +248,138 @@ def codes_arg(value):
     return [c.strip().upper() for c in value.split(",") if c.strip()] if value else []
 
 
+def host(url):
+    return urlparse(url).hostname or ""
+
+
+def password(user):
+    """Password from a file, the keyring, or the environment. Empty means type it yourself."""
+    path = os.environ.get("NTNU_PASSWORD_FILE", "")
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    try:
+        found = subprocess.run(
+            ["secret-tool", "lookup", "service", "studass", "username", user],
+            capture_output=True, text=True, timeout=5,
+        )
+        if found.returncode == 0 and found.stdout.strip():
+            return found.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("NTNU_PASSWORD", "")
+
+
+def pick_ntnu(page):
+    """Feide org selector: choose NTNU and submit."""
+    page.evaluate("""() => {
+        const field = document.getElementById('org_selector');
+        if (field) field.value = 'feide|realm|ntnu.no';
+        const form = document.getElementById('discoform_feide');
+        if (form) form.submit();
+    }""")
+
+
+def pick_microsoft(page):
+    for selector in ("#microsoft-signin-button", "form[action*='login-azuread'] input[type=submit]"):
+        box = page.locator(selector)
+        if box.count():
+            box.first.click(force=True, timeout=2000)
+            return True
+    for label in ("Bruk arbeids- eller skolekonto", "Logg inn med Microsoft", "Use work or school account"):
+        box = page.locator(f"button:has-text('{label}'), a:has-text('{label}')")
+        if box.count():
+            box.first.click(force=True, timeout=2000)
+            return True
+    return False
+
+
+def fill_credentials(page, user, secret):
+    for selector in ("input[type=email]", "input[name=loginfmt]", "input[name=username]"):
+        field = page.locator(selector)
+        if field.count() and field.first.is_visible() and not field.first.input_value():
+            field.first.fill(user)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(1500)
+            return
+    if secret:
+        field = page.locator("input[type=password]")
+        if field.count() and field.first.is_visible() and not field.first.input_value():
+            field.first.fill(secret)
+            page.keyboard.press("Enter")
+
+
+def click_text(page, *labels):
+    for label in labels:
+        box = page.locator(f"button:has-text('{label}'), a:has-text('{label}'), input[value='{label}']")
+        if box.count():
+            try:
+                box.first.click(force=True, timeout=2000)
+                return True
+            except PlaywrightTimeout:
+                pass
+    return False
+
+
+def mfa_number(page):
+    box = page.locator("#idRichContext_DisplaySign")
+    if box.count():
+        text = (box.first.text_content(timeout=1000) or "").strip()
+        if text.isdigit():
+            return text
+    return ""
+
+
+def drive_login(page, user, timeout_ms=LOGIN_TIMEOUT_MS):
+    """Walk Feide and Entra as far as it goes. Returns once the portal is reachable."""
+    secret = password(user)
+    if not secret:
+        print("No stored password, type it in the window when Microsoft asks.")
+    shown = ""
+    waited = 0
+    while waited < timeout_ms:
+        page.wait_for_timeout(2000)
+        waited += 2000
+        where = host(page.url)
+        if where == "ie.ntnu.no":
+            if logged_in(page):
+                return True
+            goto(page, APPLY_PAGE)
+            continue
+        if where not in IDP_HOSTS:
+            continue
+        if where == "auth.dataporten.no":
+            tile = page.locator("#accounts a.section-list")
+            if tile.count():
+                tile.first.click(timeout=2000)
+                continue
+            pick_ntnu(page)
+            pick_microsoft(page)
+            continue
+        if where == "idp.feide.no":
+            if not pick_microsoft(page):
+                fill_credentials(page, user, secret)
+            continue
+        if "fido" in page.url:
+            click_text(page, "Sign in another way", "Logg på på en annen måte")
+            page.keyboard.press("Escape")
+            continue
+        number = mfa_number(page)
+        if number:
+            if number != shown:
+                print(f"MFA number: {number}  (type it in Authenticator)")
+                shown = number
+            continue
+        if click_text(page, "Ja", "Yes"):          # stay signed in, keeps the session alive
+            continue
+        if click_text(page, "Approve a request on my Microsoft Authenticator app", "Approve a request"):
+            continue
+        fill_credentials(page, user, secret)
+    return False
+
+
 def cmd_preflight(args):
     ok, message = reachable()
     print(message)
@@ -248,13 +392,9 @@ def cmd_login(args):
         die(EXIT_UNREACHABLE, message)
     with portal(headless=False) as (ctx, page):
         goto(page, SSO)
-        print("Log in with Feide in the window that opened.")
-        while True:
-            input("Press Enter when the studass portal is on screen: ")
-            goto(page, APPLY_PAGE)
-            if logged_in(page):
-                break
-            print("The portal still does not look logged in. Finish the login and try again.")
+        print(f"Logging in as {args.user}. NTNU is picked for you, MFA is yours.")
+        if not drive_login(page, args.user):
+            die(EXIT_NO_SESSION, "login did not finish in time, run it again")
         who = username(page)
         print("Brukernavn:", who or "could not read it from the profile page")
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -421,7 +561,9 @@ def main():
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("preflight").set_defaults(func=cmd_preflight)
-    sub.add_parser("login").set_defaults(func=cmd_login)
+    login_cmd = sub.add_parser("login")
+    login_cmd.add_argument("--user", default=NTNU_USER)
+    login_cmd.set_defaults(func=cmd_login)
     sub.add_parser("dump").set_defaults(func=cmd_dump)
     list_cmd = sub.add_parser("list")
     list_cmd.add_argument("--campus", choices=("trondheim",))
