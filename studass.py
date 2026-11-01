@@ -222,11 +222,13 @@ def keep(option, only, exclude, campus):
 def ordered(options, only=None, exclude=None, campus=None):
     wanted = [o for o in options if keep(o, only, exclude, campus)]
     ranking = priority_order()
+
     def key(option):
         try:
             return (0, ranking.index(option["code"]), "")
         except ValueError:
             return (1, tier(option["code"]), option["label"])
+
     return sorted(wanted, key=key)
 
 
@@ -259,7 +261,9 @@ def password(user):
     try:
         found = subprocess.run(
             ["secret-tool", "lookup", "service", "studass", "username", user],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if found.returncode == 0 and found.stdout.strip():
             return found.stdout.strip()
@@ -368,7 +372,7 @@ def drive_login(page, user, timeout_ms=LOGIN_TIMEOUT_MS):
                 print(f"MFA number: {number}  (type it in Authenticator)")
                 shown = number
             continue
-        if click_text(page, "Ja", "Yes"):          # stay signed in, keeps the session alive
+        if click_text(page, "Ja", "Yes"):  # stay signed in, keeps the session alive
             continue
         if click_text(page, "Approve a request on my Microsoft Authenticator app", "Approve a request"):
             continue
