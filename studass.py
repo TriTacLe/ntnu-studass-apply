@@ -37,11 +37,11 @@ IDP_HOSTS = ("idp.feide.no", "auth.dataporten.no", "login.microsoftonline.com", 
 
 COURSE_CODE = re.compile(r"\b([A-ZÆØÅ]{2,6}\d{4})\b")
 ELEVEN_DIGITS = re.compile(r"\b\d{11}\b")
-DEADLINE = re.compile(r"frist[^0-9]{0,40}(\d{1,2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{2,4})", re.I)
-SUBMIT_TEXT = re.compile(r"legg inn|søk|send|lagre", re.I)
-JUNK_LABEL = re.compile(r"^\s*test", re.I)
-GJOVIK = re.compile(r"gj.vik", re.I)
-GJOVIK_CODE = re.compile(r"^(IDATG|IELEG|ELEG|IDG|PROG|G1001)", re.I)
+DEADLINE = re.compile(r"frist[^0-9]{0,40}(\d{1,2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{2,4})", re.IGNORECASE)
+SUBMIT_TEXT = re.compile(r"legg inn|søk|send|lagre", re.IGNORECASE)
+JUNK_LABEL = re.compile(r"^\s*test", re.IGNORECASE)
+GJOVIK = re.compile(r"gj.vik", re.IGNORECASE)
+GJOVIK_CODE = re.compile(r"^(IDATG|IELEG|ELEG|IDG|PROG|G1001)", re.IGNORECASE)
 TIERS = ("TDT IT DCST DIFT ITO IDI IDATT", "TTM IIK IIKT", "TTK", "MA TMA IMAT IMAG TFOR")
 
 
@@ -127,7 +127,7 @@ def round_title(page):
     for selector in ("h1", "h2", "title"):
         node = page.query_selector(selector)
         if node:
-            text = (node.inner_text() if selector != "title" else node.inner_text()).strip()
+            text = node.inner_text().strip()
             if text:
                 return text
     return ""
@@ -238,7 +238,7 @@ def scrub(html):
         r"(<input[^>]*(?:fodsel|f%C3%B8dsel|person)[^>]*value=\")[^\"]*(\")",
         r"\1REDACTED\2",
         html,
-        flags=re.I,
+        flags=re.IGNORECASE,
     )
 
 
@@ -261,6 +261,7 @@ def password(user):
     try:
         found = subprocess.run(
             ["secret-tool", "lookup", "service", "studass", "username", user],
+            check=False,
             capture_output=True,
             text=True,
             timeout=5,
@@ -406,7 +407,7 @@ def cmd_dump(args):
     raw = OUT / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     stamp = date.today().isoformat()
-    with portal(headless=not args.headed) as (ctx, page):
+    with portal(headless=not args.headed) as (_ctx, page):
         require_session(page)
         for name, url in (("front", BASE), ("apply", APPLY_PAGE), ("profile", PROFILE_PAGE)):
             goto(page, url)
@@ -416,11 +417,11 @@ def cmd_dump(args):
 
 
 def cmd_list(args):
-    with portal(headless=not args.headed) as (ctx, page):
+    with portal(headless=not args.headed) as (_ctx, page):
         require_session(page)
         title = round_title(page)
         print("Round:", title or "unknown")
-        if re.search(r"Høst", title, re.I) and not re.search(r"2027", title):
+        if re.search(r"Høst", title, re.IGNORECASE) and not re.search(r"2027", title):
             die(EXIT_ROUND_CLOSED, "the portal still shows an autumn round, the spring round is not open")
         print("Deadline:", deadline(page) or "not stated on this page")
         select, _, _ = discover_form(page)
@@ -443,7 +444,7 @@ def cmd_list(args):
 
 
 def cmd_status(args):
-    with portal(headless=not args.headed) as (ctx, page):
+    with portal(headless=not args.headed) as (_ctx, page):
         require_session(page)
         active = active_applications(page)
         if not active:
@@ -461,7 +462,7 @@ def cmd_apply(args):
         die(EXIT_UNVERIFIED, "pass --all or --only CODE,CODE")
     comment = comment_text()
     shots = OUT / "screenshots"
-    with portal(headless=not args.headed) as (ctx, page):
+    with portal(headless=not args.headed) as (_ctx, page):
         require_session(page)
         title = round_title(page)
         select, comment_field, submit = discover_form(page)
@@ -530,7 +531,7 @@ def cmd_profile(args):
     path = Path(args.laos).expanduser()
     if not path.exists():
         die(EXIT_UNVERIFIED, f"no such file: {path}")
-    with portal(headless=not args.headed) as (ctx, page):
+    with portal(headless=not args.headed) as (_ctx, page):
         require_session(page, PROFILE_PAGE)
         upload = page.query_selector("input[type=file]")
         if not upload:
@@ -539,7 +540,7 @@ def cmd_profile(args):
         save = None
         for handle in page.query_selector_all("input[type=submit], button"):
             label = (handle.get_attribute("value") or handle.inner_text() or "").strip()
-            if re.search(r"lagre", label, re.I):
+            if re.search(r"lagre", label, re.IGNORECASE):
                 save = handle
                 break
         if not save:
@@ -547,7 +548,9 @@ def cmd_profile(args):
         save.click()
         page.wait_for_load_state("domcontentloaded")
         body = page.inner_text("body")
-        if re.search(r"personnummer", body, re.I) and re.search(r"må|mangler|feil", body, re.I):
+        if re.search(r"personnummer", body, re.IGNORECASE) and re.search(
+            r"må|mangler|feil", body, re.IGNORECASE
+        ):
             die(
                 EXIT_UNVERIFIED,
                 "the portal refused the save and is asking for a personnummer. "
